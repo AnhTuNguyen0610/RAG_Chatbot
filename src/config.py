@@ -5,7 +5,7 @@
 LOCAL_MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
 
 # CPU/API mode: Google Gemini
-GEMINI_MODEL_NAME = "gemini-1.5-flash"
+GEMINI_MODEL_NAME = "gemini-2.0-flash"
 
 # Embedding model (used for both modes)
 EMBEDDING_MODEL = "bkai-foundation-models/vietnamese-bi-encoder"
