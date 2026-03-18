@@ -1,5 +1,9 @@
 # RAG PDF Chatbot
 
+https://ragchatbot-anhtunguyen0610.streamlit.app/
+
+---
+
 A Vietnamese-optimized document Q&A system built on Retrieval-Augmented Generation (RAG). Upload PDF files, ask questions in Vietnamese, and receive accurate answers grounded in your documents.
 
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat&logo=python&logoColor=white)
