@@ -13,7 +13,8 @@ python-dotenv==1.1.0
 pypdf
 tqdm
 tiktoken
-sentencepiece 
+sentencepiece
 protobuf
 streamlit==1.36.0
 einops
+sentence-transformers>=2.7.0

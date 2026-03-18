@@ -1,6 +1,5 @@
 # Model loading utilities for RAG Chatbot
 
-import os
 import gc
 import torch
 import streamlit as st
@@ -10,13 +9,12 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.pipelines import pipeline
 from transformers.utils.quantization_config import BitsAndBytesConfig
-
 from .config import LOCAL_MODEL_NAME, GEMINI_MODEL_NAME, EMBEDDING_MODEL, DEFAULT_DEVICE
-
 
 # ============================================================================
 # GPU Memory Management
 # ============================================================================
+
 def get_gpu_memory_info():
     """Get GPU memory usage information"""
     if torch.cuda.is_available():
@@ -26,7 +24,6 @@ def get_gpu_memory_info():
         allocated_memory = torch.cuda.memory_allocated(gpu_id) / (1024**3)
         reserved_memory = torch.cuda.memory_reserved(gpu_id) / (1024**3)
         free_memory = total_memory - reserved_memory
-
         return {
             "available": True,
             "gpu_name": gpu_name,
@@ -46,18 +43,14 @@ def clear_gpu_memory():
         try:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            # Reset peak memory stats
             torch.cuda.reset_peak_memory_stats()
         except Exception as e:
-            # If CUDA is in bad state, just collect garbage
             print(f"Warning: Could not clear CUDA cache: {e}")
-            pass
     return True
 
 
 def clear_vector_store():
     """Clear ChromaDB vector store from memory"""
-    # This will be handled in session state
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -66,12 +59,12 @@ def clear_vector_store():
 # ============================================================================
 # Model Loading Functions
 # ============================================================================
+
 @st.cache_resource
 def load_embedding_model(device: str = None):
     """Load and cache the embedding model"""
     device = device or DEFAULT_DEVICE
 
-    # Determine device for embeddings
     if device == "auto":
         model_device = "cuda" if torch.cuda.is_available() else "cpu"
     elif device == "cuda" and not torch.cuda.is_available():
@@ -91,9 +84,13 @@ def load_embedding_model(device: str = None):
 
 
 def load_gemini_model(api_key: str):
-    """Load Gemini model with API key"""
-    os.environ["GOOGLE_API_KEY"] = api_key
-
+    """
+    Load Gemini model with API key.
+    NOTE: Intentionally NOT cached with @st.cache_resource.
+    The Gemini client is cheap to instantiate (no weights to load) and caching
+    it would cause stale/expired keys to keep being used after the user updates
+    their key — exactly the bug this fixes.
+    """
     llm = ChatGoogleGenerativeAI(
         model=GEMINI_MODEL_NAME,
         google_api_key=api_key,
@@ -104,9 +101,7 @@ def load_gemini_model(api_key: str):
 
 
 def load_gemini_embeddings(api_key: str):
-    """Load Google Gemini embedding model via API - fast, no GPU needed"""
-    os.environ["GOOGLE_API_KEY"] = api_key
-
+    """Load Google Gemini embedding model via API — fast, no GPU needed"""
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/embedding-001",
         google_api_key=api_key,
@@ -117,12 +112,10 @@ def load_gemini_embeddings(api_key: str):
 @st.cache_resource
 def load_local_llm_model():
     """Load and cache Qwen2.5-3B-Instruct model with 4-bit quantization for GPU"""
-
     if not torch.cuda.is_available():
         st.error("❌ GPU không khả dụng! Vui lòng chọn CPU mode để dùng Gemini API.")
         return None, None
 
-    # Use 4-bit quantization for GPU
     nf4_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -160,15 +153,9 @@ def load_local_llm_model():
 
 def unload_models():
     """Unload all cached models and clear memory"""
-    # Clear cached resources
     st.cache_resource.clear()
-
-    # Run garbage collection
     gc.collect()
-
-    # Clear CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
     return True

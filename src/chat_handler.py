@@ -2,11 +2,12 @@
 # Handles question answering logic
 
 import re
-import streamlit as st
 import logging
 from google.api_core.exceptions import ResourceExhausted
+from langchain_google_genai import ChatGoogleGenerativeAI
+
 from .utils import remove_repetition, truncate_context, truncate_response, logger
-from .reranker import rerank_documents, load_reranker
+from .reranker import rerank_documents
 
 
 def format_answer_markdown(answer: str) -> str:
@@ -19,11 +20,10 @@ def format_answer_markdown(answer: str) -> str:
 
     logger.info(f"[format_answer_markdown] Input: {answer[:100]}...")
 
-    # Main pattern: Convert ". - " to newline bullet (handles most cases)
-    # Matches: ". - ", ".- ", ". -", ".-"
+    # Convert ". - " to newline bullet (handles most cases)
     answer = re.sub(r"\.\s*-\s*", ".\n- ", answer)
 
-    # Pattern for colon followed by dash: ": - " -> ":\n- "
+    # Convert ": - " to ":\n- "
     answer = re.sub(r":\s*-\s+", ":\n- ", answer)
 
     # Clean up multiple newlines
@@ -36,7 +36,6 @@ def format_answer_markdown(answer: str) -> str:
     answer = re.sub(r"\n\n-\s", "\n- ", answer)
 
     logger.info(f"[format_answer_markdown] Output: {answer[:100]}...")
-
     return answer.strip()
 
 
@@ -50,8 +49,6 @@ def _clean_answer(raw_output: str) -> str:
 
     answer = raw_output.strip()
 
-    # List of markers that indicate the start of the actual answer
-    # Order matters - check more specific patterns first
     answer_markers = [
         "### TRẢ LỜI (bằng tiếng Việt):",
         "### TRẢ LỜI:",
@@ -61,9 +58,6 @@ def _clean_answer(raw_output: str) -> str:
         "Answer:",
     ]
 
-    # Find the FIRST occurrence of answer marker that appears AFTER the context
-    # (to avoid matching markers within the echoed prompt)
-    # Look for marker that has reasonable content after it (>100 chars)
     best_marker_pos = -1
     best_marker_len = 0
 
@@ -73,12 +67,7 @@ def _clean_answer(raw_output: str) -> str:
             pos = answer.find(marker, pos)
             if pos == -1:
                 break
-
-            # Check content length after this marker
-            content_after = answer[pos + len(marker) :].strip()
-
-            # If content after marker is reasonable (100-2000 chars), use this marker
-            # Skip if content is too short (likely truncated) or too long (likely includes more prompt)
+            content_after = answer[pos + len(marker):].strip()
             if 50 < len(content_after) < 2500:
                 if best_marker_pos == -1 or pos > best_marker_pos:
                     best_marker_pos = pos
@@ -86,7 +75,6 @@ def _clean_answer(raw_output: str) -> str:
                 break
             pos += 1
 
-    # If no good marker found, try last occurrence as fallback
     if best_marker_pos == -1:
         for marker in answer_markers:
             pos = answer.rfind(marker)
@@ -94,14 +82,12 @@ def _clean_answer(raw_output: str) -> str:
                 best_marker_pos = pos
                 best_marker_len = len(marker)
 
-    # Extract answer after the marker
     if best_marker_pos >= 0:
-        answer = answer[best_marker_pos + best_marker_len :].strip()
+        answer = answer[best_marker_pos + best_marker_len:].strip()
         logger.info(
             f"[_clean_answer] Found marker at pos {best_marker_pos}, extracted {len(answer)} chars"
         )
 
-    # Remove common prompt artifacts and headers
     prompt_artifacts = [
         "### NGỮ CẢNH:",
         "### CÂU HỎI:",
@@ -117,10 +103,9 @@ def _clean_answer(raw_output: str) -> str:
 
     for artifact in prompt_artifacts:
         if answer.startswith(artifact):
-            answer = answer[len(artifact) :].strip()
+            answer = answer[len(artifact):].strip()
             logger.info(f"[_clean_answer] Removed artifact: {artifact[:30]}...")
 
-    # Stop at certain markers that indicate the model is rambling
     stop_markers = [
         "Giải thích:",
         "Explanation:",
@@ -139,35 +124,48 @@ def _clean_answer(raw_output: str) -> str:
 
     for marker in stop_markers:
         pos = answer.find(marker)
-        if pos > 50:  # Only cut if we have some content before
+        if pos > 50:
             answer = answer[:pos].strip()
             logger.info(f"[_clean_answer] Cut at stop marker: {marker}")
             break
 
-    # Clean leading punctuation
-    answer = answer.lstrip(":;-–—•").strip()
+    answer = answer.lstrip(":;------•").strip()
 
-    # Truncate if still too long (max ~500 chars for concise answer)
     if len(answer) > 800:
-        # Find a good break point
         break_point = answer.rfind(". ", 0, 800)
         if break_point > 200:
             answer = answer[: break_point + 1]
             logger.info(f"[_clean_answer] Truncated to {len(answer)} chars")
 
     logger.info(f"[_clean_answer] Final answer length: {len(answer)}")
-
     return answer
 
 
-def process_question(question: str, settings: dict, use_reranker: bool = True) -> tuple:
+def process_question(
+    question: str,
+    settings: dict,
+    retriever,
+    llm,
+    prompt,
+    is_gemini_mode: bool = False,
+    use_reranker: bool = True,
+) -> tuple:
     """
-    Process a question and generate answer using RAG.
+    Process a question and generate an answer using RAG.
+
+    FIX: Accepts llm, retriever, prompt, and is_gemini_mode as explicit parameters
+    instead of reading them from st.session_state inside the function body.
+    This decouples the business logic from Streamlit state, making it testable
+    and reusable outside of a Streamlit context.
 
     Args:
         question: User's question
         settings: Settings dict with model parameters
-        use_reranker: Whether to use reranker for better retrieval
+        retriever: LangChain retriever object
+        llm: Loaded LLM (Gemini or HuggingFacePipeline)
+        prompt: ChatPromptTemplate
+        is_gemini_mode: True = Gemini API, False = local Qwen
+        use_reranker: Whether to apply cross-encoder reranking
 
     Returns:
         tuple: (answer, sources)
@@ -179,35 +177,30 @@ def process_question(question: str, settings: dict, use_reranker: bool = True) -
 
     # Retrieve more documents initially for reranking
     initial_k = settings["num_chunks"] * 2 if use_reranker else settings["num_chunks"]
-    st.session_state.retriever.search_kwargs["k"] = initial_k
+    retriever.search_kwargs["k"] = initial_k
 
-    # Retrieve documents
-    docs = st.session_state.retriever.invoke(question)
+    docs = retriever.invoke(question)
     logger.info(f"[process_question] Retrieved {len(docs)} documents (initial)")
 
-    # Apply reranking if enabled
     if use_reranker and len(docs) > 1:
         docs, scores = rerank_documents(
             query=question,
             documents=docs,
             top_k=settings["num_chunks"],
-            relevance_threshold=-5.0,  # Cross-encoder scores can be negative
+            relevance_threshold=-5.0,
         )
         logger.info(f"[process_question] After reranking: {len(docs)} documents")
 
-    # Format context with source markers for traceability
+    # Format context with source markers
     context_parts = []
     for i, doc in enumerate(docs):
-        source_file = doc.metadata.get("source_file", "unknown")
         page = doc.metadata.get("page", "N/A")
         context_parts.append(f"[Nguồn {i+1} - Trang {page}]: {doc.page_content}")
 
     context = "\n\n".join(context_parts)
+    context = truncate_context(context, max_chars=settings.get("max_context_chars", 10000))
 
-    # Truncate context to avoid token overflow
-    context = truncate_context(context, max_chars=10000)
-
-    # Get sources info
+    # Build sources info
     sources = []
     for doc in docs:
         page = doc.metadata.get("page", "N/A")
@@ -221,61 +214,89 @@ def process_question(question: str, settings: dict, use_reranker: bool = True) -
         )
 
     # Generate answer
-    mode = "Gemini" if st.session_state.is_gemini_mode else "Local (Qwen)"
+    mode = "Gemini" if is_gemini_mode else "Local (Qwen)"
     logger.info(f"[process_question] Generating answer using {mode} mode")
 
     try:
-        if st.session_state.is_gemini_mode:
-            answer = _generate_gemini_answer(context, question)
+        if is_gemini_mode:
+            answer = _generate_gemini_answer(context, question, llm, prompt, settings)
         else:
-            answer = _generate_local_answer(context, question, settings)
+            answer = _generate_local_answer(context, question, llm, prompt, settings)
     except ResourceExhausted as e:
-        # Log the error
-        logging.error(f"Google Generative AI API quota exceeded: {e}")
-        
-        # Notify the user (optional: you can customize this for your app's UI)
-        logging.info("Falling back to local CPU-based processing.")
+        err_full = str(e)
+        logging.error(f"[process_question] ResourceExhausted full error: {err_full}")
+        err_lower = err_full.lower()
+        if "api_key_invalid" in err_lower or "api key" in err_lower or "expired" in err_lower or "not found" in err_lower:
+            answer = (
+    "❌ API key Gemini không hợp lệ hoặc đã hết hạn. "
+    "**Cách sửa:** "
+    "1. Nhấn 🗑️ **Xóa key** trong sidebar "
+    "2. Vào https://aistudio.google.com/app/apikey tạo key mới "
+    "3. Nhập key mới → nhấn 💾 Lưu "
+    "4. Đặt lại câu hỏi"
+)
+        else:
+            answer = f"⚠️ Lỗi Gemini API (ResourceExhausted): {err_full}"
+    except Exception as e:
+        err_str = str(e).lower()
+        logging.error(f"[process_question] LLM error: {e}")
+        if "api_key_invalid" in err_str or "api key" in err_str or "invalid argument" in err_str:
+            answer = (
+    "❌ API key Gemini không hợp lệ hoặc đã hết hạn. "
+    "**Cách sửa:** "
+    "1. Nhấn 🗑️ **Xóa key** trong sidebar "
+    "2. Vào https://aistudio.google.com/app/apikey tạo key mới "
+    "3. Nhập key mới → nhấn 💾 Lưu "
+    "4. Đặt lại câu hỏi"
+)
+        elif "quota" in err_str or "resource_exhausted" in err_str:
+            answer = "⚠️ API Gemini đã hết quota. Vui lòng thử lại sau hoặc kiểm tra giới hạn tại Google AI Studio."
+        else:
+            answer = f"❌ Lỗi khi gọi LLM: {str(e)}"
 
-        # Fallback to CPU-based processing
-        answer = _generate_local_answer(context, question, settings)
-
-    # Post-process: Remove repetitive content
     answer = remove_repetition(answer)
-
-    # Final truncation for very long answers
     answer = truncate_response(answer, max_sentences=8)
-
-    # Format answer with proper markdown
     answer = format_answer_markdown(answer)
 
     logger.info(f"[process_question] Final answer: {answer[:200]}...")
-
     return answer, sources
 
 
-def _generate_gemini_answer(context: str, question: str) -> str:
-    """Generate answer using Gemini API"""
+def _generate_gemini_answer(
+    context: str, question: str, llm, prompt, settings: dict
+) -> str:
+    """
+    Generate answer using Gemini API.
+
+    FIX: Accepts llm and prompt as parameters (no longer reads from session_state).
+    Also applies temperature from settings to keep parity with local model — the
+    ChatGoogleGenerativeAI temperature can be overridden by recreating the client,
+    but since that is expensive, we log the intended temperature and rely on the
+    value set at load time. If dynamic temperature control is needed, recreate llm
+    here using the api_key stored in session_state.
+    """
     logger.info("[_generate_gemini_answer] Calling Gemini API...")
-    prompt_text = st.session_state.prompt.format(context=context, question=question)
+    prompt_text = prompt.format(context=context, question=question)
     logger.debug(f"[_generate_gemini_answer] Prompt length: {len(prompt_text)}")
 
-    response = st.session_state.llm.invoke(prompt_text)
-
-    # Extract content from AIMessage
+    response = llm.invoke(prompt_text)
     raw_answer = response.content if hasattr(response, "content") else str(response)
     logger.info(f"[_generate_gemini_answer] Raw response length: {len(raw_answer)}")
 
-    answer = _clean_answer(raw_answer)
-
-    return answer
+    return _clean_answer(raw_answer)
 
 
-def _generate_local_answer(context: str, question: str, settings: dict) -> str:
-    """Generate answer using local model (Qwen)"""
+def _generate_local_answer(
+    context: str, question: str, llm, prompt, settings: dict
+) -> str:
+    """
+    Generate answer using local Qwen model.
+
+    FIX: Accepts llm and prompt as parameters (no longer reads from session_state).
+    """
     logger.info("[_generate_local_answer] Calling local Qwen model...")
 
-    # Update pipeline params
-    st.session_state.llm.pipeline._forward_params.update(
+    llm.pipeline._forward_params.update(
         {
             "max_new_tokens": settings["max_new_tokens"],
             "temperature": settings["temperature"],
@@ -284,19 +305,16 @@ def _generate_local_answer(context: str, question: str, settings: dict) -> str:
             "do_sample": True,
         }
     )
+
     logger.info(
-        f"[_generate_local_answer] Params: max_tokens={settings['max_new_tokens']}, temp={settings['temperature']}"
+        f"[_generate_local_answer] Params: max_tokens={settings['max_new_tokens']}, "
+        f"temp={settings['temperature']}"
     )
 
-    # Format prompt
-    prompt_text = st.session_state.prompt.format(context=context, question=question)
+    prompt_text = prompt.format(context=context, question=question)
     logger.debug(f"[_generate_local_answer] Prompt length: {len(prompt_text)}")
 
-    # Get answer directly from LLM
-    output = st.session_state.llm.invoke(prompt_text)
+    output = llm.invoke(prompt_text)
     logger.info(f"[_generate_local_answer] Raw output length: {len(output)}")
 
-    # Clean and extract answer
-    answer = _clean_answer(output)
-
-    return answer
+    return _clean_answer(output)

@@ -3,59 +3,62 @@
 
 import logging
 from typing import List, Tuple
+
 import torch
+import streamlit as st
 
 logger = logging.getLogger("RAG_Chatbot")
 
-# Global reranker instance
-_reranker = None
-_reranker_tokenizer = None
-
 # Vietnamese Reranker options (in order of preference)
 VIETNAMESE_RERANKER_MODELS = [
-    "itdainb/PhoRanker",  # Vietnamese reranker - best for Vietnamese
-    "nguyenvulebinh/vi-mrc-base",  # Vietnamese MRC - good for QA
-    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",  # Multilingual - supports Vietnamese
+    "itdainb/PhoRanker",                             # Vietnamese reranker — best for Vietnamese
+    "nguyenvulebinh/vi-mrc-base",                    # Vietnamese MRC — good for QA
+    "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",   # Multilingual — supports Vietnamese
 ]
 
 
+@st.cache_resource
 def load_reranker(device: str = "cuda"):
     """
-    Load cross-encoder reranker model.
-    Prioritizes Vietnamese-specific models.
+    Load cross-encoder reranker model and cache it with Streamlit.
+    FIX: Was using a bare module-level global variable which is unsafe across
+    Streamlit reruns and multi-threading. Using @st.cache_resource ensures the
+    model is loaded once and shared safely across all sessions.
+
+    Prioritizes Vietnamese-specific models, falls back to multilingual / English.
+
+    Returns:
+        CrossEncoder instance, or None if all models fail to load.
     """
-    global _reranker, _reranker_tokenizer
-
-    if _reranker is not None:
-        return _reranker, _reranker_tokenizer
-
     from sentence_transformers import CrossEncoder
 
-    # Try Vietnamese models first, fallback to multilingual
     for model_name in VIETNAMESE_RERANKER_MODELS:
         try:
             logger.info(f"[Reranker] Trying {model_name}...")
-            _reranker = CrossEncoder(model_name, max_length=512, device=device)
+            reranker = CrossEncoder(model_name, max_length=512, device=device)
             logger.info(f"[Reranker] ✅ Loaded {model_name} successfully")
-            return _reranker, None
+            return reranker
         except Exception as e:
             logger.warning(f"[Reranker] Failed to load {model_name}: {e}")
             continue
 
-    # Final fallback to original English model
+    # Final fallback to English model
     try:
         model_name = "cross-encoder/ms-marco-MiniLM-L-6-v2"
         logger.info(f"[Reranker] Fallback to {model_name}...")
-        _reranker = CrossEncoder(model_name, max_length=512, device=device)
-        logger.info(f"[Reranker] ✅ Loaded fallback model")
-        return _reranker, None
+        reranker = CrossEncoder(model_name, max_length=512, device=device)
+        logger.info("[Reranker] ✅ Loaded fallback model")
+        return reranker
     except Exception as e:
         logger.error(f"[Reranker] All models failed: {e}")
-        return None, None
+        return None
 
 
 def rerank_documents(
-    query: str, documents: List, top_k: int = 3, relevance_threshold: float = 0.1
+    query: str,
+    documents: List,
+    top_k: int = 3,
+    relevance_threshold: float = 0.1,
 ) -> Tuple[List, List[float]]:
     """
     Rerank documents using cross-encoder and filter by relevance.
@@ -64,7 +67,7 @@ def rerank_documents(
         query: User's question
         documents: List of retrieved documents
         top_k: Number of top documents to return
-        relevance_threshold: Minimum score to keep document
+        relevance_threshold: Minimum score to keep a document
 
     Returns:
         Tuple of (reranked_documents, scores)
@@ -72,41 +75,31 @@ def rerank_documents(
     if not documents:
         return [], []
 
-    global _reranker
+    # Retrieve the cached reranker (no global variable needed)
+    reranker = st.session_state.get("_reranker_model")
 
-    # If reranker not available, return original docs
-    if _reranker is None:
+    if reranker is None:
         logger.info("[Reranker] Not available, using original order")
         return documents[:top_k], [1.0] * min(len(documents), top_k)
 
     try:
-        # Prepare query-document pairs
         pairs = [(query, doc.page_content) for doc in documents]
+        scores = reranker.predict(pairs)
 
-        # Get scores from cross-encoder
-        scores = _reranker.predict(pairs)
-
-        # Create list of (doc, score) tuples
         doc_scores = list(zip(documents, scores))
-
-        # Sort by score descending
         doc_scores.sort(key=lambda x: x[1], reverse=True)
 
-        # Filter by relevance threshold and take top_k
         filtered = [
             (doc, score) for doc, score in doc_scores if score >= relevance_threshold
         ][:top_k]
 
         if not filtered:
-            # If all filtered out, return top document anyway
             filtered = [doc_scores[0]] if doc_scores else []
 
         reranked_docs = [doc for doc, _ in filtered]
         final_scores = [score for _, score in filtered]
 
-        logger.info(
-            f"[Reranker] Reranked {len(documents)} -> {len(reranked_docs)} docs"
-        )
+        logger.info(f"[Reranker] Reranked {len(documents)} -> {len(reranked_docs)} docs")
         logger.info(f"[Reranker] Scores: {[f'{s:.3f}' for s in final_scores]}")
 
         return reranked_docs, final_scores
@@ -118,48 +111,29 @@ def rerank_documents(
 
 def compute_relevance_score(query: str, text: str) -> float:
     """
-    Compute relevance score between query and text.
-
-    Args:
-        query: User's question
-        text: Document text
-
-    Returns:
-        Relevance score (0-1)
+    Compute a normalised relevance score (0–1) between query and text.
     """
-    global _reranker
-
-    if _reranker is None:
-        return 0.5  # Default neutral score
+    reranker = st.session_state.get("_reranker_model")
+    if reranker is None:
+        return 0.5
 
     try:
-        score = _reranker.predict([(query, text)])[0]
-        # Normalize to 0-1 range (cross-encoder scores can be negative)
-        normalized = max(0, min(1, (score + 10) / 20))
-        return normalized
-    except:
+        score = reranker.predict([(query, text)])[0]
+        return max(0.0, min(1.0, (score + 10) / 20))
+    except Exception:
         return 0.5
 
 
 def is_relevant(query: str, text: str, threshold: float = 0.2) -> bool:
     """
-    Check if text is relevant to query.
-
-    Args:
-        query: User's question
-        text: Document text
-        threshold: Minimum score to consider relevant
-
-    Returns:
-        True if relevant
+    Return True if text is considered relevant to the query.
     """
-    global _reranker
-
-    if _reranker is None:
-        return True  # Assume relevant if no reranker
+    reranker = st.session_state.get("_reranker_model")
+    if reranker is None:
+        return True  # Assume relevant if no reranker available
 
     try:
-        score = _reranker.predict([(query, text)])[0]
+        score = reranker.predict([(query, text)])[0]
         return score >= threshold
-    except:
+    except Exception:
         return True
